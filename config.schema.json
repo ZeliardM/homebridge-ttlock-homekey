@@ -1,8 +1,9 @@
 {
-  "pluginAlias": "ExampleHomebridgePlugin",
+  "pluginAlias": "TTLockHomeKey",
   "pluginType": "platform",
   "singular": true,
-  "strictValidation": false,
+  "headerDisplay": "TTLock HomeKey Plugin.<p>Most users do not require configuration and can just click \"Save\" to get started. See [README](https://github.com/ZeliardM/homebridge-ttlock-homekey/blob/latest/README.md) for more information.</p>",
+  "footerDisplay": "",
   "schema": {
     "type": "object",
     "properties": {
@@ -10,8 +11,52 @@
         "title": "Name",
         "type": "string",
         "required": true,
-        "default": "Example Dynamic Platform"
+        "default": "TTLockHomeKey",
+        "minLength": 1
+      },
+      "clientId": {
+        "title": "Client ID",
+        "type": "string",
+        "description": "Client ID for TTLock Cloud API.",
+        "placeholder": "Client ID",
+        "minLength": 1
+      },
+      "clientSecret": {
+        "title": "Client Secret",
+        "type": "string",
+        "description": "Client Secret for TTLock Cloud API.",
+        "placeholder": "Client Secret",
+        "minLength": 1
+      },
+      "username": {
+        "title": "Username",
+        "type": "string",
+        "description": "Username for TTLock App Account.",
+        "placeholder": "Username",
+        "minLength": 1
+      },
+      "password": {
+        "title": "Password",
+        "type": "string",
+        "description": "Password for TTLock App Account.",
+        "placeholder": "Password",
+        "minLength": 1
+      },
+      "color": {
+        "title": "HomeKey Color",
+        "type": "string",
+        "description": "Select the color for the HomeKey in the Wallet App.",
+        "enum": ["Black", "Gold", "Silver", "Tan"],
+        "default": "Tan"
       }
     }
-  }
+  },
+  "layout": [
+    "name",
+    "clientId",
+    "clientSecret",
+    "username",
+    "password",
+    "color"
+  ]
 }

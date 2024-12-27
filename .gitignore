@@ -1,8 +1,11 @@
+# Custom ignore rules
+user_storage/*
+!user_storage/config.example.json
+
 # Ignore compiled code
 dist
 
 # ------------- Defaults ------------- #
-.DS_Store
 
 # Logs
 logs
@@ -122,5 +125,3 @@ dist
 
 # Webstorm
 .idea
-
-/test/hbConfig
