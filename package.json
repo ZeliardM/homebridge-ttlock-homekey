@@ -24,7 +24,9 @@
     "watch": "npm run build && npm link && nodemon"
   },
   "keywords": [
+    "access code",
     "homebridge-plugin",
+    "homekey",
     "ttlock",
     "smart-lock"
   ],
