@@ -12,7 +12,7 @@ export interface Lock {
 }
 
 export interface LockId{
-    lockId: string;
+  lockId: string;
 }
 
 export type LockIdList = LockId[];
