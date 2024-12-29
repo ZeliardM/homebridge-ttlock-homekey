@@ -28,6 +28,7 @@ export class TTLockApi {
         'Content-Type': 'application/x-www-form-urlencoded',
       },
     });
+    this.log.debug('TTLockApi instance created');
   }
 
   private encryptPassword(password: string): string {
@@ -35,6 +36,7 @@ export class TTLockApi {
   }
 
   public async authenticate(username: string, password: string): Promise<void> {
+    this.log.debug('Authenticating with TTLock API');
     try {
       const encryptedPassword = this.encryptPassword(password);
       const response = await this.apiClient.post('oauth2/token', qs.stringify({
@@ -48,16 +50,13 @@ export class TTLockApi {
       if (response.data.access_token && response.data.refresh_token) {
         this.accessToken = response.data.access_token;
         this.refreshToken = response.data.refresh_token;
+        this.log.info('Authenticated with TTLock API');
       } else {
         this.log.error('Authentication response did not contain tokens:', response.data);
         throw new Error('Authentication failed: No tokens received');
       }
     } catch (error) {
-      if (axios.isAxiosError(error)) {
-        this.log.error('Failed to authenticate with TTLock API:', error.response?.data || error.message);
-      } else {
-        this.log.error('Failed to authenticate with TTLock API:', error);
-      }
+      this.handleError('Failed to authenticate with TTLock API', error);
       throw error;
     }
   }
@@ -69,6 +68,7 @@ export class TTLockApi {
 
     const release = await this.tokenMutex.acquire();
     try {
+      this.log.debug('Refreshing access token');
       const response = await this.apiClient.post('oauth2/token', qs.stringify({
         client_id: this.clientId,
         client_secret: this.clientSecret,
@@ -76,109 +76,92 @@ export class TTLockApi {
         refresh_token: this.refreshToken,
       }));
 
-      this.accessToken = response.data.access_token;
-      this.refreshToken = response.data.refresh_token;
+      if (response.data.access_token && response.data.refresh_token) {
+        this.accessToken = response.data.access_token;
+        this.refreshToken = response.data.refresh_token;
+        this.log.debug('Access token refreshed');
+      } else {
+        throw new Error('Failed to refresh token: Invalid response');
+      }
+    } catch (error) {
+      this.handleError('Failed to refresh access token', error);
+      throw error;
     } finally {
       release();
     }
   }
 
-  private async processQueue(): Promise<void> {
-    if (this.isProcessingQueue) {
-      return;
-    }
-    this.isProcessingQueue = true;
+  private async makeAuthenticatedRequest<T>(endpoint: string, method: 'GET' | 'POST' = 'GET', data?: Record<string, unknown>): Promise<T> {
+    const maxRetries = 3;
 
-    while (this.requestQueue.length > 0) {
-      const request = this.requestQueue.shift();
-      if (request) {
-        try {
-          await request();
-        } catch (error) {
-          this.log.error('Error processing request:', error);
+    if (!this.accessToken) {
+      throw new Error('Not authenticated. Please call authenticate() first.');
+    }
+
+    const requestData = {
+      ...data,
+      clientId: this.clientId,
+      accessToken: this.accessToken,
+      date: Date.now(),
+    };
+
+    const fullEndpoint = `v3/${endpoint}`;
+
+    for (let attempt = 0; attempt <= maxRetries; attempt++) {
+      try {
+        const response = await this.apiClient.request({
+          url: fullEndpoint,
+          method,
+          headers: {
+            Authorization: `Bearer ${this.accessToken}`,
+          },
+          params: method === 'GET' ? requestData : undefined,
+          data: method === 'POST' ? qs.stringify(requestData) : undefined,
+        });
+
+        if (response.data.errcode && response.data.errcode !== 0) {
+          throw new RequestFailed(`API returned error: ${response.data.errmsg || 'Unknown error'}`);
         }
+
+        return response.data;
+      } catch (error) {
+        if (error instanceof RequestFailed) {
+          const errorMsg = error.message;
+          this.log.debug(`Attempt ${attempt + 1} failed: ${errorMsg}`);
+          if (attempt < maxRetries) {
+            const delay = Math.pow(2, attempt) * 1000;
+            this.log.debug(`Retrying in ${delay / 1000} seconds...`);
+            await new Promise(resolve => setTimeout(resolve, delay));
+            continue;
+          }
+        } else if (axios.isAxiosError(error) && error.response) {
+          if (error.response.status === 401) {
+            this.log.debug('Access token expired, refreshing token...');
+            await this.refreshTokenIfNeeded();
+            continue;
+          }
+          this.log.error(`Request failed: status=${error.response.status}, body=${JSON.stringify(error.response.data)}`);
+          throw new RequestFailed(`Request failed: status=${error.response.status}, body=${JSON.stringify(error.response.data)}`);
+        }
+        this.handleError('Request failed', error);
+        throw error;
       }
     }
-
-    this.isProcessingQueue = false;
+    throw new Error('Max retries reached');
   }
 
-  private enqueueRequest(request: () => Promise<void>): void {
-    this.requestQueue.push(request);
-    this.processQueue();
-  }
-
-  private async makeAuthenticatedRequest<T>(endpoint: string, method: 'GET' | 'POST' = 'GET', data?: Record<string, unknown>): Promise<T> {
-    return new Promise<T>((resolve, reject) => {
-      this.enqueueRequest(async () => {
-        const maxRetries = 3;
-        if (!this.accessToken) {
-          throw new Error('Not authenticated. Please call authenticate() first.');
-        }
-
-        const requestData = {
-          ...data,
-          clientId: this.clientId,
-          accessToken: this.accessToken,
-          date: Date.now(),
-        };
-
-        const fullEndpoint = `v3/${endpoint}`;
-
-        for (let attempt = 0; attempt <= maxRetries; attempt++) {
-          try {
-            const response = await this.apiClient.request({
-              url: fullEndpoint,
-              method,
-              headers: {
-                Authorization: `Bearer ${this.accessToken}`,
-              },
-              params: method === 'GET' ? requestData : undefined,
-              data: method === 'POST' ? qs.stringify(requestData) : undefined,
-            });
-
-            if (response.data.errcode && response.data.errcode !== 0) {
-              this.log.error(`API returned error: ${response.data.errmsg}`);
-              throw new RequestFailed(`API returned: ${response.data.errmsg}`);
-            }
-
-            resolve(response.data);
-            return;
-          } catch (error: unknown) {
-            if (axios.isAxiosError(error) && error.response) {
-              if (error.response.status === 401) {
-                this.log.warn('Access token expired, refreshing token...');
-                await this.refreshTokenIfNeeded();
-                continue;
-              }
-              if (error.response.data.errmsg === 'The gateway is busy. Please try again later.') {
-                this.log.warn(`Attempt ${attempt + 1} failed: ${error.response.data.errmsg}`);
-                if (attempt < maxRetries) {
-                  const delay = Math.pow(2, attempt) * 1000;
-                  this.log.warn(`Retrying in ${delay / 1000} seconds...`);
-                  await new Promise(resolve => setTimeout(resolve, delay));
-                  continue;
-                }
-              }
-              this.log.error(`Request failed: status=${error.response.status}, body=${JSON.stringify(error.response.data)}`);
-              reject(new RequestFailed(`Request failed: status=${error.response.status}, body=${error.response.data}`));
-              return;
-            }
-            if (error instanceof Error) {
-              this.log.error(`Request failed: ${error.message}`);
-            } else {
-              this.log.error(`Request failed: ${JSON.stringify(error)}`);
-            }
-            reject(error);
-            return;
-          }
-        }
-        reject(new Error('Max retries reached'));
-      });
-    });
+  private handleError(message: string, error: unknown): void {
+    if (axios.isAxiosError(error)) {
+      this.log.error(`${message}: ${error.response?.data || error.message}`);
+    } else if (error instanceof Error) {
+      this.log.error(`${message}: ${error.message}`);
+    } else {
+      this.log.error(`${message}: ${JSON.stringify(error)}`);
+    }
   }
 
   public async getLocks(): Promise<LockIdList> {
+    this.log.debug('Fetching list of locks');
     const response = await this.makeAuthenticatedRequest<{
       list: { lockId: string }[];
       pageNo: number;
@@ -188,15 +171,18 @@ export class TTLockApi {
     }>('lock/list', 'GET', { pageNo: 1, pageSize: 1000 });
 
     if (!response.list || !Array.isArray(response.list)) {
+      this.log.error('Invalid response format: expected list of locks');
       throw new Error('Invalid response format: expected list of locks');
     }
 
+    this.log.info(`Found ${response.list.length} locks`);
     return response.list.map((item) => ({
       lockId: item.lockId.toString(),
     }));
   }
 
   public async getLockDetails(lockId: string): Promise<LockDetails> {
+    this.log.debug(`Fetching details for lock: ${lockId}`);
     const data = await this.makeAuthenticatedRequest<LockDetails>('lock/detail', 'GET', { lockId });
     return {
       lockId: data.lockId.toString(),
@@ -209,9 +195,10 @@ export class TTLockApi {
   }
 
   public async getLockState(lockId: string): Promise<LockState> {
+    this.log.debug(`Fetching state for lock: ${lockId}`);
     const data = await this.makeAuthenticatedRequest<LockState>('lock/queryOpenState', 'GET', { lockId });
     return {
-      state: data.state,
+      state: data.state === 0 ? 1 : data.state === 1 ? 0 : data.state,
     };
   }
 
@@ -222,6 +209,7 @@ export class TTLockApi {
     lockPasscodes: PasscodeList,
     lockNfcCards: NfcCardList,
   ): Promise<Lock> {
+    this.log.debug(`Mapping lock details to Lock object for lock: ${lockDetails.lockId}`);
     return {
       id: lockDetails.lockId.toString(),
       alias: lockDetails.lockAlias,
@@ -233,18 +221,25 @@ export class TTLockApi {
       battery: lockBattery.battery,
       passCodes: lockPasscodes,
       nfcCards: lockNfcCards,
+      offline: false,
+      lastSeen: new Date(),
     };
   }
 
   public async lock(lockId: string): Promise<void> {
-    return this.makeAuthenticatedRequest('lock/lock', 'POST', { lockId });
+    this.log.debug(`Locking lock: ${lockId}`);
+    await this.makeAuthenticatedRequest('lock/lock', 'POST', { lockId });
+    this.log.debug(`Lock ${lockId} locked`);
   }
 
   public async unlock(lockId: string): Promise<void> {
-    return this.makeAuthenticatedRequest('lock/unlock', 'POST', { lockId });
+    this.log.debug(`Unlocking lock: ${lockId}`);
+    await this.makeAuthenticatedRequest('lock/unlock', 'POST', { lockId });
+    this.log.debug(`Lock ${lockId} unlocked`);
   }
 
   public async getBatteryLevel(lockId: string): Promise<BatteryLevel> {
+    this.log.debug(`Fetching battery level for lock: ${lockId}`);
     const data = await this.makeAuthenticatedRequest<{ electricQuantity: number }>('lock/queryElectricQuantity', 'GET', { lockId });
     return {
       battery: data.electricQuantity,
@@ -252,6 +247,7 @@ export class TTLockApi {
   }
 
   public async getPasscodes(lockId: string): Promise<PasscodeList> {
+    this.log.debug(`Fetching passcodes for lock: ${lockId}`);
     const response = await this.makeAuthenticatedRequest<{
       list: {
         keyboardPwdId: string;
@@ -265,9 +261,11 @@ export class TTLockApi {
     }>('lock/listKeyboardPwd', 'GET', { lockId, pageNo: 1, pageSize: 1000, orderBy: 0 });
 
     if (!response.list || !Array.isArray(response.list)) {
+      this.log.error('Invalid response format: expected list of passcodes');
       throw new Error('Invalid response format: expected list of passcodes');
     }
 
+    this.log.debug(`Found ${response.list.length} passcodes for lock: ${lockId}`);
     return response.list.map((item, index) => ({
       id: item.keyboardPwdId.toString(),
       index: (index).toString(),
@@ -277,32 +275,29 @@ export class TTLockApi {
   }
 
   public async addPasscode(lockId: string, passcode: string): Promise<{ keyboardPwdId: string }> {
-    return this.makeAuthenticatedRequest('keyboardPwd/add', 'POST', {
+    this.log.debug(`Adding passcode to lock: ${lockId}`);
+    const response = await this.makeAuthenticatedRequest<{ keyboardPwdId: string }>('keyboardPwd/add', 'POST', {
       lockId,
       keyboardPwd: passcode,
       keyboardPwdType: 2,
       addType: 2,
     });
-  }
-
-  public async changePasscode(lockId: string, passcodeId: string, passcode: string): Promise<void> {
-    return this.makeAuthenticatedRequest('keyboardPwd/change', 'POST', {
-      lockId,
-      keyboardPwdId: passcodeId,
-      newKeyboardPwd: passcode,
-      changeType: 2,
-    });
+    this.log.debug(`Passcode added to lock: ${lockId}`);
+    return response;
   }
 
   public async deletePasscode(lockId: string, passcodeId: string): Promise<void> {
-    return this.makeAuthenticatedRequest('keyboardPwd/delete', 'POST', {
+    this.log.debug(`Deleting passcode for lock: ${lockId}`);
+    await this.makeAuthenticatedRequest('keyboardPwd/delete', 'POST', {
       lockId,
       keyboardPwdId: passcodeId,
       deleteType: 2,
     });
+    this.log.debug(`Passcode deleted for lock: ${lockId}`);
   }
 
   public async getNfcCards(lockId: string): Promise<NfcCardList> {
+    this.log.debug(`Fetching NFC cards for lock: ${lockId}`);
     const response = await this.makeAuthenticatedRequest<{
       list: {
         cardId: string;
@@ -316,9 +311,11 @@ export class TTLockApi {
     }>('identityCard/list', 'GET', { lockId, pageNo: 1, pageSize: 1000, orderBy: 0 });
 
     if (!response.list || !Array.isArray(response.list)) {
+      this.log.error('Invalid response format: expected list of NFC cards');
       throw new Error('Invalid response format: expected list of NFC cards');
     }
 
+    this.log.debug(`Found ${response.list.length} NFC cards for lock: ${lockId}`);
     return response.list.map((item) => ({
       id: item.cardId.toString(),
       lockId: item.lockId.toString(),
@@ -327,20 +324,25 @@ export class TTLockApi {
   }
 
   public async addNfcCard(lockId: string, cardNumber: string): Promise<{ cardId: string }> {
-    return this.makeAuthenticatedRequest('identityCard/addForReversedCardNumber', 'POST', {
+    this.log.debug(`Adding NFC card to lock: ${lockId}`);
+    const response = await this.makeAuthenticatedRequest<{ cardId: string }>('identityCard/addForReversedCardNumber', 'POST', {
       lockId,
       cardNumber,
       startDate: 0,
       endDate: 0,
       addType: 2,
     });
+    this.log.debug(`NFC card added to lock: ${lockId}`);
+    return response;
   }
 
   public async deleteNfcCard(lockId: string, cardId: string): Promise<void> {
-    return this.makeAuthenticatedRequest('card/delete', 'POST', {
+    this.log.debug(`Deleting NFC card for lock: ${lockId}`);
+    await this.makeAuthenticatedRequest('card/delete', 'POST', {
       lockId,
       cardId,
       deleteType: 2,
     });
+    this.log.debug(`NFC card deleted for lock: ${lockId}`);
   }
 }

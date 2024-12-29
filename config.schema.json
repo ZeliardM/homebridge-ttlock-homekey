@@ -48,6 +48,24 @@
         "description": "Select the color for the HomeKey in the Wallet App.",
         "enum": ["Black", "Gold", "Silver", "Tan"],
         "default": "Tan"
+      },
+      "pollingInterval": {
+        "title": "Polling Interval (seconds)",
+        "type": "integer",
+        "description": "How often to check device status in the background (seconds)",
+        "default": 5
+      },
+      "discoveryPollingInterval": {
+        "title": "Discovery Polling Interval (seconds)",
+        "type": "integer",
+        "description": "How often to discover new devices in the background (seconds)",
+        "default": 300
+      },
+      "offlineInterval": {
+        "title": "Offline Interval (days)",
+        "type": "integer",
+        "description": "How often to remove offline devices in the background (days)",
+        "default": 7
       }
     }
   },
@@ -57,6 +75,17 @@
     "clientSecret",
     "username",
     "password",
-    "color"
+    "color",
+    {
+      "type": "fieldset",
+      "title": "Device Discovery (Optional)",
+      "description": "Customize device discovery",
+      "expandable": true,
+      "items": [
+        "pollingInterval",
+        "discoveryPollingInterval",
+        "offlineInterval"
+      ]
+    }
   ]
 }

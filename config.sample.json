@@ -14,7 +14,12 @@
       "clientSecret": "YourClientSecret",
       "username": "YourUsername",
       "password": "YourPassword",
-      "color": "Tan"
+      "color": "Tan",
+      "discoveryOptions": {
+        "pollingInterval": 5,
+        "discoveryPollingInterval": 300,
+        "offlineInterval": 7
+      }
     }
   ],
   "accessories": []

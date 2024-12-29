@@ -6,18 +6,17 @@ import type {
 } from 'homebridge';
 
 export function deferAndCombine<T, U>(
-  fn: (requestCount: number, args: U[]) => Promise<T>,
+  fn: (args: U[]) => Promise<T>,
   timeout: number,
   runNowFn?: (arg: U) => void,
 ): (arg?: U) => Promise<T> {
-  let requests: { resolve: (value: T) => void; reject: (reason?: unknown) => void; arg: U }[] = [];
+  let requests: { resolve: (value: T) => void; reject: (reason?: unknown) => void }[] = [];
   let timer: NodeJS.Timeout | null = null;
 
   const processRequests = () => {
     const currentRequests = requests;
     requests = [];
-    const args = currentRequests.map(req => req.arg);
-    fn(currentRequests.length, args)
+    fn(currentRequests.map(req => req.resolve as unknown as U))
       .then(value => currentRequests.forEach(req => req.resolve(value)))
       .catch(error => currentRequests.forEach(req => req.reject(error)))
       .finally(() => timer = null);
@@ -29,7 +28,7 @@ export function deferAndCombine<T, U>(
     }
 
     return new Promise<T>((resolve, reject) => {
-      requests.push({ resolve, reject, arg: arg as U });
+      requests.push({ resolve, reject });
 
       if (!timer) {
         timer = setTimeout(processRequests, timeout);

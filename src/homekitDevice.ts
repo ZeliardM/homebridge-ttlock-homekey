@@ -1,4 +1,4 @@
-import type {
+import {
   Characteristic,
   CharacteristicValue,
   Logging,
@@ -8,56 +8,96 @@ import type {
 } from 'homebridge';
 
 import pkg from 'ber-tlv';
+import { EventEmitter } from 'node:events';
 
 import platformAccessoryInformation from './platformAccessoryInformation.js';
 import { TTLockAccessoryContext, TTLockHomeKeyPlatform } from './platform.js';
 import { TTLockApi } from './api/ttlockApi.js';
-import { Lock } from './types/index.js';
+import { Lock, TLV8Configuration } from './types/index.js';
 
 const { TlvFactory } = pkg;
 
+function encodeTLV8(data: TLV8Configuration): Buffer {
+  const tlvBuffer = [];
+  for (const [key, value] of Object.entries(data)) {
+    const keyInt = parseInt(key, 16);
+    tlvBuffer.push(Buffer.from([keyInt, value.length, ...value]));
+  }
+  return Buffer.concat(tlvBuffer);
+}
+
+function getAccessCodeSupportedConfiguration(): string {
+  const configuration: TLV8Configuration = {
+    '01': Buffer.from([1]),
+    '02': Buffer.from([6]),
+    '03': Buffer.from([9]),
+    '04': Buffer.from([10]),
+  };
+  return encodeTLV8(configuration).toString('base64');
+}
+
+function getNFCAccessSupportedConfiguration(): string {
+  const configuration: TLV8Configuration = {
+    '01': Buffer.from([10]),
+    '02': Buffer.from([10]),
+  };
+  return encodeTLV8(configuration).toString('base64');
+}
 
 export class TTLockHomeKitDevice {
   private readonly log: Logging;
-  private readonly ttLockApi: TTLockApi | null = null;
-  platformAccessory: PlatformAccessory<TTLockAccessoryContext>;
+  private readonly ttLockApi?: TTLockApi;
+  private debounceTimeout: NodeJS.Timeout | null = null;
+  private lastStateChangeTime: number = 0;
   private lockBusy = false;
+  private pollingInterval?: NodeJS.Timeout;
+  private previousLock?: Lock;
+  private updateEmitter = new EventEmitter();
+
+  public isUpdating = false;
+  public platformAccessory: PlatformAccessory<TTLockAccessoryContext>;
 
   constructor(
     private readonly platform: TTLockHomeKeyPlatform,
-    private readonly lock: Lock,
+    public lock: Lock,
   ) {
-    this.log = platform.log;
-    this.ttLockApi = platform.ttLockApi;
+    this.log = this.platform.log;
+    this.log.info(`Initializing TTLockHomeKitDevice for ${this.lock.alias}`);
+    this.ttLockApi = this.platform.ttLockApi;
 
     this.platformAccessory = this.initalizeAccessory();
     this.platformAccessory.on('identify', () => this.identify());
-
     this.checkServices();
+    this.startPolling();
+
+    this.platform.periodicDeviceDiscoveryEmitter.on('periodicDeviceDiscoveryComplete', () => {
+      this.updateEmitter.emit('periodicDeviceDiscoveryComplete');
+    });
   }
 
   private initalizeAccessory(): PlatformAccessory<TTLockAccessoryContext> {
     const uuid = this.platform.api.hap.uuid.generate(this.lock.id);
-    const configuredPlatformAccessory = this.platform.configuredAccessories.get(uuid);
+    const existingAccessory = this.platform.configuredAccessories.get(uuid);
     let platformAccessory: PlatformAccessory<TTLockAccessoryContext>;
 
-    if (!configuredPlatformAccessory) {
+    if (!existingAccessory) {
       this.log.debug(`Creating new Platform Accessory [${this.id}] [${uuid}]`);
       platformAccessory = new this.platform.api.platformAccessory(this.name, uuid);
       platformAccessory.context.id = this.id;
       this.platform.registerPlatformAccessory(platformAccessory);
     } else {
-      this.log.debug(`Existing Platform Accessory found [${configuredPlatformAccessory.context.id}] ` +
-        `[${configuredPlatformAccessory.UUID}]`);
-      platformAccessory = configuredPlatformAccessory;
+      this.log.debug(`Existing Platform Accessory found [${existingAccessory.context.id}] [${existingAccessory.UUID}]`);
+      platformAccessory = existingAccessory;
       this.updatePlatformAccessory(platformAccessory);
     }
 
-    const accInfo = platformAccessoryInformation(this.platform.api.hap, this.platform.config.color)(platformAccessory, this);
+    const accInfo = platformAccessoryInformation(this.platform.api.hap, this.platform.config.color)(
+      platformAccessory,
+      this,
+    );
     if (!accInfo) {
-      this.log.error('Could not retrieve default AccessoryInformation');
+      this.log.error('Failed to retrieve default AccessoryInformation.');
     }
-
     return platformAccessory;
   }
 
@@ -70,7 +110,7 @@ export class TTLockHomeKitDevice {
 
   private correctPlatformAccessory<T, K extends keyof T>(obj: T, key: K, expectedValue: T[K]): void {
     if (obj[key] !== expectedValue) {
-      this.log.warn(`Correcting Platform Accessory ${String(key)} from: ${String(obj[key])} to: ${String(expectedValue)}`);
+      this.log.debug(`Correcting Platform Accessory ${String(key)} from: ${String(obj[key])} to: ${String(expectedValue)}`);
       obj[key] = expectedValue;
     }
   }
@@ -108,20 +148,16 @@ export class TTLockHomeKitDevice {
       this.platform.api.hap.Service.NFCAccess,
     ];
 
-    services.forEach(service => {
+    services.forEach((svc) => {
       const checkedService: Service =
-        this.platformAccessory.getService(service) ?? this.addService(service, this.name);
+        this.platformAccessory.getService(svc) ??
+        this.platformAccessory.addService(svc, this.name, this.platformAccessory.UUID);
+
       if (checkedService.UUID !== this.platform.api.hap.Service.LockManagement.UUID) {
         this.checkCharacteristics(checkedService);
       }
       return checkedService;
     });
-  }
-
-  private addService(serviceConstructor: WithUUID<typeof this.platform.api.hap.Service>, name: string): Service {
-    const serviceName = this.platform.getServiceName(serviceConstructor);
-    this.log.debug(`Creating new ${serviceName} Service on ${name}`);
-    return this.platformAccessory.addService(serviceConstructor, name, this.platformAccessory.UUID);
   }
 
   private checkCharacteristics(service: Service): void {
@@ -174,37 +210,31 @@ export class TTLockHomeKitDevice {
           name: this.platform.getCharacteristicName(this.platform.api.hap.Characteristic.ConfigurationState),
         },
       ],
-    };
+    } as const;
 
     const serviceName = this.platform.getServiceName(service) as keyof typeof characteristicsMap;
     const characteristics = characteristicsMap[serviceName] || [];
 
-    if (service.UUID === this.platform.api.hap.Service.AccessCode.UUID) {
-      service.setCharacteristic(this.platform.api.hap.Characteristic.AccessCodeSupportedConfiguration, 'AQEBAwEGAwEJBAEQ');
-    } else if (service.UUID === this.platform.api.hap.Service.NFCAccess.UUID) {
-      service.setCharacteristic(this.platform.api.hap.Characteristic.NFCAccessSupportedConfiguration, 'AQEBAwEGAwEJBAEQ');
-    }
-
-    characteristics.forEach(({ type }) => {
-      this.getOrAddCharacteristic(service, type);
+    characteristics.forEach(({ type, name }) => {
+      this.getOrAddCharacteristic(service, type, name);
     });
   }
 
   private getOrAddCharacteristic(
     service: Service,
     characteristicType: WithUUID<new () => Characteristic>,
+    characteristicName?: string,
   ): Characteristic {
-    const characteristic: Characteristic = service.getCharacteristic(characteristicType) ??
+    const characteristic = service.getCharacteristic(characteristicType) ??
       service.addCharacteristic(characteristicType);
 
-    characteristic.onGet(this.handleOnGet.bind(this, service, characteristicType));
-
+    characteristic.onGet(this.handleOnGet.bind(this, service, characteristicType, characteristicName));
     if (characteristicType === this.platform.api.hap.Characteristic.LockTargetState) {
-      characteristic.onSet(this.handleSetLockState.bind(this));
+      characteristic.onSet(this.handleLockTargetStateOnSet.bind(this, service));
     } else if (characteristicType === this.platform.api.hap.Characteristic.AccessCodeControlPoint) {
-      characteristic.onSet(this.handleSetAccessCodeControlPoint.bind(this));
+      characteristic.onSet(this.handleAccessCodeControlPointOnSet.bind(this));
     } else if (characteristicType === this.platform.api.hap.Characteristic.NFCAccessControlPoint) {
-      characteristic.onSet(this.handleSetNFCAccessControlPoint.bind(this));
+      characteristic.onSet(this.handleNFCAccessControlPointOnSet.bind(this));
     }
 
     return characteristic;
@@ -213,120 +243,194 @@ export class TTLockHomeKitDevice {
   private async handleOnGet(
     service: Service,
     characteristicType: WithUUID<new () => Characteristic>,
+    characteristicName: string | undefined,
   ): Promise<CharacteristicValue> {
-    if (characteristicType === this.platform.api.hap.Characteristic.LockCurrentState) {
-      return this.handleGetLockState();
-    } else if (characteristicType === this.platform.api.hap.Characteristic.BatteryLevel) {
-      return this.handleBattery('batteryLevel');
-    } else if (characteristicType === this.platform.api.hap.Characteristic.StatusLowBattery) {
-      return this.handleBattery('lowBattery');
-    } else if (characteristicType === this.platform.api.hap.Characteristic.AccessCodeControlPoint) {
-      this.log.info('Queried Access Code Control Point');
-      return '';
-    } else if (characteristicType === this.platform.api.hap.Characteristic.NFCAccessControlPoint) {
-      this.log.info('Queried NFC Access Control Point');
-      return '';
-    } else if (characteristicType === this.platform.api.hap.Characteristic.ConfigurationState) {
-      if (service.UUID === this.platform.api.hap.Service.AccessCode.UUID) {
-        this.log.info('Queried Access Code Configuration State');
-      } else if (service.UUID === this.platform.api.hap.Service.NFCAccess.UUID) {
-        this.log.info('Queried NFC Access Configuration State');
-      }
-      return this.lockBusy ? 1 : 0;
-    }
-    return '';
-  }
-
-  private async handleGetLockState(): Promise<CharacteristicValue> {
     try {
-      if (!this.ttLockApi) {
-        throw new Error('TTLock API not initialized');
+      if (this.lock.offline || this.platform.isShuttingDown) {
+        this.log.debug(`Device is offline or shutting down, returning default for ${characteristicName}`);
+        return this.getDefaultValue(characteristicType);
       }
-      const lock = await this.ttLockApi.getLockState(this.lock.id);
-      if (lock.state === 0) {
-        this.log.info(`Lock secured: ${this.name}`);
-        return this.platform.api.hap.Characteristic.LockCurrentState.SECURED;
-      } else {
-        this.log.info(`Lock unsecured: ${this.name}`);
-        return this.platform.api.hap.Characteristic.LockCurrentState.UNSECURED;
+      if (
+        characteristicType !== this.platform.api.hap.Characteristic.AccessCodeControlPoint &&
+        characteristicType !== this.platform.api.hap.Characteristic.NFCAccessControlPoint
+      ) {
+        let value = service.getCharacteristic(characteristicType).value as CharacteristicValue | undefined;
+        if (!value) {
+          value = this.getInitialValue(characteristicType, service);
+          service.getCharacteristic(characteristicType).updateValue(value);
+        }
+        this.log.debug(`Got value for ${characteristicName}: ${value}`);
+        return value ?? this.getDefaultValue(characteristicType);
       }
     } catch (error) {
-      this.log.error(`Failed to get current lock state for ${this.lock.id}:`, error);
-      throw error;
+      this.log.error(`Error getting value for ${characteristicName} on ${this.name}:`, error);
+      this.lock.offline = true;
+      this.stopPolling();
+    }
+    return this.getDefaultValue(characteristicType);
+  }
+
+  private getInitialValue(
+    characteristicType: WithUUID<new () => Characteristic>,
+    service: Service,
+  ): CharacteristicValue {
+    switch (characteristicType) {
+      case this.platform.api.hap.Characteristic.LockCurrentState:
+        return this.lock.state ?? this.platform.api.hap.Characteristic.LockCurrentState.SECURED;
+      case this.platform.api.hap.Characteristic.LockTargetState:
+        return this.lock.state ?? this.platform.api.hap.Characteristic.LockTargetState.SECURED;
+      case this.platform.api.hap.Characteristic.BatteryLevel:
+        return this.lock.battery ?? 100;
+      case this.platform.api.hap.Characteristic.StatusLowBattery:
+        return this.lock.battery < 20
+          ? this.platform.api.hap.Characteristic.StatusLowBattery.BATTERY_LEVEL_LOW
+          : this.platform.api.hap.Characteristic.StatusLowBattery.BATTERY_LEVEL_NORMAL;
+      case this.platform.api.hap.Characteristic.AccessCodeSupportedConfiguration:
+        return this.handleAccessCodeSupportedConfigurationOnGet(service);
+      case this.platform.api.hap.Characteristic.NFCAccessSupportedConfiguration:
+        return this.handleNFCAccessSupportedConfigurationOnGet(service);
+      case this.platform.api.hap.Characteristic.ConfigurationState:
+        return this.handleConfigurationStateOnGet(service);
+      default:
+        return this.getDefaultValue(characteristicType);
     }
   }
 
-  private async handleSetLockState(value: CharacteristicValue): Promise<void> {
-    try {
+  private getDefaultValue(characteristicType: WithUUID<new () => Characteristic>): CharacteristicValue {
+    const hap = this.platform.api.hap;
+    switch (characteristicType) {
+      case hap.Characteristic.LockCurrentState:
+        return hap.Characteristic.LockCurrentState.SECURED;
+      case hap.Characteristic.LockTargetState:
+        return hap.Characteristic.LockTargetState.SECURED;
+      case hap.Characteristic.BatteryLevel:
+        return 100;
+      case hap.Characteristic.StatusLowBattery:
+        return hap.Characteristic.StatusLowBattery.BATTERY_LEVEL_NORMAL;
+      case hap.Characteristic.AccessCodeSupportedConfiguration:
+        return 'AQEBAgEGAwEJBAEK';
+      case hap.Characteristic.NFCAccessSupportedConfiguration:
+        return 'AQEKAgEK';
+      case hap.Characteristic.AccessCodeControlPoint:
+      case hap.Characteristic.NFCAccessControlPoint:
+        return '';
+      case hap.Characteristic.ConfigurationState:
+        return 1;
+      default:
+        return '';
+    }
+  }
+
+  private handleAccessCodeSupportedConfigurationOnGet(service: Service): CharacteristicValue {
+    const value = getAccessCodeSupportedConfiguration();
+    service
+      .getCharacteristic(this.platform.api.hap.Characteristic.AccessCodeSupportedConfiguration)
+      .updateValue(value);
+    return (
+      service.getCharacteristic(this.platform.api.hap.Characteristic.AccessCodeSupportedConfiguration).value ??
+      value
+    );
+  }
+
+  private handleNFCAccessSupportedConfigurationOnGet(service: Service): CharacteristicValue {
+    const value = getNFCAccessSupportedConfiguration();
+    service
+      .getCharacteristic(this.platform.api.hap.Characteristic.NFCAccessSupportedConfiguration)
+      .updateValue(value);
+    return (
+      service.getCharacteristic(this.platform.api.hap.Characteristic.NFCAccessSupportedConfiguration).value ??
+      value
+    );
+  }
+
+  private handleConfigurationStateOnGet(service: Service): CharacteristicValue {
+    service
+      .getCharacteristic(this.platform.api.hap.Characteristic.ConfigurationState)
+      .updateValue(this.lockBusy ? 0 : 1);
+    return service.getCharacteristic(this.platform.api.hap.Characteristic.ConfigurationState).value ?? 1;
+  }
+
+  private async handleLockTargetStateOnSet(service: Service, value: CharacteristicValue): Promise<void> {
+    if (this.debounceTimeout) {
+      clearTimeout(this.debounceTimeout);
+    }
+
+    this.debounceTimeout = setTimeout(async () => {
+      if (this.lock.offline || this.platform.isShuttingDown) {
+        this.log.debug('Device offline or shutting down, cannot set LockTargetState');
+        return;
+      }
+
+      await this.waitForPendingUpdates();
+
       if (!this.ttLockApi) {
+        this.log.error(`TTLock API unavailable for ${this.name}`);
         throw new Error('TTLock API not initialized');
       }
-      const targetState = value as number;
-      if (targetState === this.platform.api.hap.Characteristic.LockTargetState.SECURED) {
-        await this.ttLockApi.lock(this.lock.id);
-        this.log.info(`Lock secured: ${this.name}`);
-      } else {
-        await this.ttLockApi.unlock(this.lock.id);
-        this.log.info(`lock unsecured: ${this.name}`);
+      try {
+        this.isUpdating = true;
+        if (value === this.platform.api.hap.Characteristic.LockTargetState.SECURED) {
+          await this.ttLockApi.lock(this.lock.id);
+        } else {
+          await this.ttLockApi.unlock(this.lock.id);
+        }
+        this.lock.state = value as number;
+        service.getCharacteristic(this.platform.api.hap.Characteristic.LockTargetState).updateValue(value);
+        service.getCharacteristic(this.platform.api.hap.Characteristic.LockCurrentState).updateValue(value);
+        const lockState = this.lock.state === 1 ? 'SECURED' : 'UNSECURED';
+        this.log.info(`Lock state set to ${lockState} for ${this.name}`);
+        this.lastStateChangeTime = Date.now();
+      } catch (error) {
+        this.log.error(`Error setting LockTargetState for ${this.name}:`, error);
+        this.lock.offline = true;
+        this.stopPolling();
+      } finally {
+        this.isUpdating = false;
+        this.updateEmitter.emit('updateComplete');
       }
-    } catch (error) {
-      this.log.error(`Failed to set lock state for ${this.lock.id}:`, error);
-      throw error;
-    }
+    }, 500);
   }
 
-  private async handleBattery(type: 'lowBattery' | 'batteryLevel'): Promise<CharacteristicValue> {
+  private async handleAccessCodeControlPointOnSet(value: CharacteristicValue): Promise<string> {
+    if (this.lock.offline || this.platform.isShuttingDown) {
+      this.log.debug('Device offline or shutting down, cannot set LockTargetState');
+      return '';
+    }
+
+    await this.waitForPendingUpdates();
+
     if (!this.ttLockApi) {
+      this.log.error(`TTLock API unavailable for ${this.name}`);
       throw new Error('TTLock API not initialized');
     }
-
-    const lock = await this.ttLockApi.getBatteryLevel(this.lock.id);
-
-    if (type === 'lowBattery') {
-      if (lock.battery < 20) {
-        this.log.warn(`Low battery level: ${this.name}`);
-        return this.platform.api.hap.Characteristic.StatusLowBattery.BATTERY_LEVEL_LOW;
-      } else {
-        return this.platform.api.hap.Characteristic.StatusLowBattery.BATTERY_LEVEL_NORMAL;
-      }
-    } else {
-      return lock.battery;
-    }
-  }
-
-  private async handleSetAccessCodeControlPoint(value: CharacteristicValue): Promise<string> {
-    if (!this.ttLockApi) {
-      throw new Error('TTLock API not initialized');
-    }
-    try{
+    try {
+      this.isUpdating = true;
       this.lockBusy = true;
-      this.log.debug(`Setting Access Code Control Point: ${value}`);
       const decTlv = TlvFactory.parse(Buffer.from(value.toString(), 'base64').toString('hex'));
-      this.log.debug(`Decoded TLV: ${JSON.stringify(decTlv)}`);
+      this.log.debug(`Decoded Access Code TLV: ${JSON.stringify(decTlv)}`);
+
       let responseTlv = '';
       let response = '';
       let identifier = '', accessCode = '', flags = '', status = '';
 
       switch (Number(decTlv[0].value.toString('hex'))) {
-        case 1: {
-          this.log.debug('Case 1: List Request');
+        case 1:
+          this.log.debug('Access Code Control: List Request');
           responseTlv = '010101';
           this.lock.passCodes.forEach((pc, index) => {
             identifier = TlvFactory.serialize(TlvFactory.primitiveTlv('01', String(pc.index).padStart(2, '0'))).toString('hex');
             accessCode = TlvFactory.serialize(TlvFactory.primitiveTlv('02', Buffer.from(pc.passcode).toString('hex'))).toString('hex');
             flags = TlvFactory.serialize(TlvFactory.primitiveTlv('03', '00')).toString('hex');
             status = TlvFactory.serialize(TlvFactory.primitiveTlv('04', '00')).toString('hex');
-            this.log.debug(`Passcode: identifier=${identifier}, accessCode=${accessCode}, flags=${flags}, status=${status}`);
+            this.log.debug(`Passcode ${pc.passcode} found on ${this.lock.alias}`);
             responseTlv += TlvFactory.serialize(
               TlvFactory.primitiveTlv('03', identifier + accessCode + flags + status),
             ).toString('hex') + (index !== (this.lock.passCodes.length - 1) ? '0000' : '');
           });
-          this.log.debug(`Response TLV: ${responseTlv}`);
           response = Buffer.from(responseTlv, 'hex').toString('base64');
           break;
-        }
         case 2:
-          this.log.debug('Case 2: Read Request');
+          this.log.debug('Access Code Control: Read Request');
           responseTlv = '010102';
           if (this.lock.passCodes.length > 0) {
             for (let index = 1; index < decTlv.length; ++index) {
@@ -337,15 +441,13 @@ export class TTLockHomeKitDevice {
                 const passcodeIndex = parseInt(passcodeIndexHex, 16);
                 const pc = this.lock.passCodes[passcodeIndex];
                 if (pc) {
-                  this.log.debug(`Read requested with passcode ${pc.passcode}`);
+                  this.log.debug(`Reading passcode ${pc.passcode} on ${this.lock.alias}`);
                   identifier = TlvFactory.serialize(TlvFactory.primitiveTlv('01', String(pc.index).padStart(2, '0'))).toString('hex');
                   accessCode = TlvFactory.serialize(
                     TlvFactory.primitiveTlv('02', Buffer.from(pc.passcode).toString('hex')),
                   ).toString('hex');
                   flags = TlvFactory.serialize(TlvFactory.primitiveTlv('03', '00')).toString('hex');
                   status = TlvFactory.serialize(TlvFactory.primitiveTlv('04', '00')).toString('hex');
-                  this.log.debug(`Passcode read request: identifier=${identifier}, ` +
-                  `accessCode=${accessCode}, flags=${flags}, status=${status}`);
                 }
               }
               responseTlv += TlvFactory.serialize(
@@ -353,67 +455,37 @@ export class TTLockHomeKitDevice {
               ).toString('hex') + (index !== (decTlv.length - 1) ? '0000' : '');
             }
           }
-          this.log.debug(`Response TLV: ${responseTlv}`);
           response = Buffer.from(responseTlv, 'hex').toString('base64');
           break;
         case 3:
-          this.log.debug('Case 3: Add or Change Request');
+          this.log.debug('Access Code Control: Add Request');
           responseTlv = '010103';
           for (let index = 1; index < decTlv.length; index++) {
-            const addchangeReq = TlvFactory.parse(decTlv[index].value);
-            if (addchangeReq.length > 0) {
-              if (addchangeReq[0].tag === '01') {
-                const newPassCodeHex = TlvFactory.parse(addchangeReq[1].value);
-                const newPassCodeIndexHex = addchangeReq[0].value.toString('hex');
-                const newPassCodeIndex = parseInt(newPassCodeIndexHex, 16);
-                const existingPc = this.lock.passCodes[newPassCodeIndex];
-                if (existingPc && newPassCodeHex.length > 0) {
-                  const newPassCode = newPassCodeHex[0].value.toString();
-                  this.log.info(`Changing passcode ${existingPc.passcode} to ${newPassCode} for lock with id ${this.lock.id}`);
-                  await this.ttLockApi.changePasscode(this.lock.id, existingPc.id, newPassCode);
-                  this.lock.passCodes = await this.ttLockApi.getPasscodes(this.lock.id);
-                  const pc = this.lock.passCodes.find(p => p.id === existingPc.id);
-                  if (pc) {
-                    identifier = TlvFactory.serialize(TlvFactory.primitiveTlv('01', String(pc.index).padStart(2, '0'))).toString('hex');
-                    accessCode = TlvFactory.serialize(
-                      TlvFactory.primitiveTlv('02', Buffer.from(pc.passcode).toString('hex')),
-                    ).toString('hex');
-                    flags = TlvFactory.serialize(TlvFactory.primitiveTlv('03', '00')).toString('hex');
-                    status = TlvFactory.serialize(TlvFactory.primitiveTlv('04', '00')).toString('hex');
-                    this.log.debug(`Changed passcode: identifier=${identifier}, accessCode=${accessCode}, ` +
-                        `flags=${flags}, status=${status}`);
-                    responseTlv += TlvFactory.serialize(
-                      TlvFactory.primitiveTlv('03', identifier + accessCode + flags + status),
-                    ).toString('hex') + (index !== (decTlv.length - 1) ? '0000' : '');
-                  }
-                }
-              } else if (addchangeReq[0].tag === '02') {
-                const newPassCodeHex = addchangeReq[0];
-                const newPassCode = newPassCodeHex.value.toString();
-                this.log.info(`Adding new passcode ${newPassCode} to lock with id: ${this.lock.id}`);
-                const newPc = await this.ttLockApi.addPasscode(this.lock.id, newPassCode);
-                this.lock.passCodes = await this.ttLockApi.getPasscodes(this.lock.id);
-                const pc = this.lock.passCodes.find(p => p.id === newPc.keyboardPwdId.toString());
-                if (pc) {
-                  identifier = TlvFactory.serialize(TlvFactory.primitiveTlv('01', String(pc.index).padStart(2, '0'))).toString('hex');
-                  accessCode = TlvFactory.serialize(
-                    TlvFactory.primitiveTlv('02', Buffer.from(pc.passcode).toString('hex')),
-                  ).toString('hex');
-                  flags = TlvFactory.serialize(TlvFactory.primitiveTlv('03', '00')).toString('hex');
-                  status = TlvFactory.serialize(TlvFactory.primitiveTlv('04', '00')).toString('hex');
-                  this.log.debug(`Added passcode: identifier=${identifier}, accessCode=${accessCode}, flags=${flags}, status=${status}`);
-                  responseTlv += TlvFactory.serialize(
-                    TlvFactory.primitiveTlv('03', identifier + accessCode + flags + status),
-                  ).toString('hex') + (index !== (decTlv.length - 1) ? '0000' : '');
-                }
+            const addReq = TlvFactory.parse(decTlv[index].value);
+            if (addReq.length > 0) {
+              const newPassCodeHex = addReq[0];
+              const newPassCode = newPassCodeHex.value.toString();
+              this.log.info(`Adding new passcode ${newPassCode} to ${this.lock.alias}`);
+              const newPc = await this.ttLockApi.addPasscode(this.lock.id, newPassCode);
+              this.lock.passCodes = await this.ttLockApi.getPasscodes(this.lock.id);
+              const pc = this.lock.passCodes.find(p => p.id === newPc.keyboardPwdId.toString());
+              if (pc) {
+                const identifier = TlvFactory.serialize(TlvFactory.primitiveTlv('01', String(pc.index).padStart(2, '0'))).toString('hex');
+                const accessCode = TlvFactory.serialize(
+                  TlvFactory.primitiveTlv('02', Buffer.from(pc.passcode).toString('hex')),
+                ).toString('hex');
+                const flags = TlvFactory.serialize(TlvFactory.primitiveTlv('03', '00')).toString('hex');
+                const status = TlvFactory.serialize(TlvFactory.primitiveTlv('04', '00')).toString('hex');
+                responseTlv += TlvFactory.serialize(
+                  TlvFactory.primitiveTlv('03', identifier + accessCode + flags + status),
+                ).toString('hex') + (index !== (decTlv.length - 1) ? '0000' : '');
               }
             }
           }
-          this.log.debug(`Response TLV: ${responseTlv}`);
           response = Buffer.from(responseTlv, 'hex').toString('base64');
           break;
         case 5: {
-          this.log.debug('Case 5: Delete Request');
+          this.log.debug('Access Code Control: Delete Request');
           responseTlv = '010105';
           const deleteReq = TlvFactory.parse(decTlv[1].value);
           if (deleteReq.length > 0) {
@@ -421,32 +493,149 @@ export class TTLockHomeKitDevice {
             const deletePassCodeIndex = parseInt(deletePassCodeIndexHex, 16);
             const pc = this.lock.passCodes[deletePassCodeIndex];
             if (pc) {
-              this.log.info(`Deleting passcode ${pc.passcode} for lock with id ${this.lock.id}`);
+              this.log.info(`Deleting passcode ${pc.passcode} on ${this.lock.alias}`);
               await this.ttLockApi.deletePasscode(this.lock.id, pc.id);
               this.lock.passCodes = await this.ttLockApi.getPasscodes(this.lock.id);
               identifier = TlvFactory.serialize(TlvFactory.primitiveTlv('01', String(pc.index).padStart(2, '0'))).toString('hex');
               accessCode = TlvFactory.serialize(TlvFactory.primitiveTlv('02', Buffer.from(pc.passcode).toString('hex'))).toString('hex');
               flags = TlvFactory.serialize(TlvFactory.primitiveTlv('03', '00')).toString('hex');
               status = TlvFactory.serialize(TlvFactory.primitiveTlv('04', '00')).toString('hex');
-              responseTlv += TlvFactory.serialize(TlvFactory.primitiveTlv('03', identifier + accessCode + flags + status)).toString('hex');
+              responseTlv += TlvFactory.serialize(
+                TlvFactory.primitiveTlv('03', identifier + accessCode + flags + status),
+              ).toString('hex');
             }
           }
-          this.log.debug(`Response TLV: ${responseTlv}`);
           response = Buffer.from(responseTlv, 'hex').toString('base64');
           break;
         }
       }
+      this.log.info(`Access Code Control request completed for ${this.lock.alias}: ${response}`);
       return response;
+    } catch (error) {
+      this.log.error(`Error setting LockTargetState for ${this.name}:`, error);
+      this.lock.offline = true;
+      this.stopPolling();
+      return '';
     } finally {
       this.lockBusy = false;
+      this.isUpdating = false;
+      this.updateEmitter.emit('updateComplete');
     }
   }
 
-  private async handleSetNFCAccessControlPoint(value: CharacteristicValue): Promise<void> {
-    this.log.info(`Setting NFC Access Control Point: ${value}`);
+  private async handleNFCAccessControlPointOnSet(value: CharacteristicValue): Promise<string> {
+    this.log.debug(`NFC Access request for ${this.name}: ${value}`);
+    return '';
+  }
+
+  protected async updateState(): Promise<void> {
+    if (this.lock.offline || this.platform.isShuttingDown) {
+      this.stopPolling();
+      return;
+    }
+
+    await this.waitForPendingUpdates();
+
+    this.isUpdating = true;
+    const task = (async () => {
+      try {
+        if (!this.ttLockApi) {
+          this.log.error(`TTLock API unavailable for update state on ${this.name}`);
+          throw new Error('TTLock API not initialized');
+        }
+        const currentTime = Date.now();
+        this.previousLock = JSON.parse(JSON.stringify(this.lock));
+        const updatedBattery = await this.ttLockApi.getBatteryLevel(this.lock.id);
+        if (updatedBattery !== undefined) {
+          this.lock.battery = updatedBattery.battery;
+        }
+        if (currentTime - this.lastStateChangeTime > 5000) {
+          const updatedState = await this.ttLockApi.getLockState(this.lock.id);
+          if (updatedState !== undefined) {
+            this.lock.state = updatedState.state;
+          }
+        }
+
+        this.updateBatteryService();
+        this.updateLockService();
+      } catch (error) {
+        this.log.error('Error updating device state:', error);
+        this.lock.offline = true;
+        this.stopPolling();
+      } finally {
+        this.isUpdating = false;
+        this.updateEmitter.emit('updateComplete');
+      }
+    })();
+
+    this.platform.ongoingTasks.push(task);
+    await task;
+    this.platform.ongoingTasks = this.platform.ongoingTasks.filter((t) => t !== task);
+  }
+
+  public startPolling(): void {
+    if (this.lock.offline || this.platform.isShuttingDown) {
+      this.stopPolling();
+      return;
+    }
+    if (this.pollingInterval) {
+      clearInterval(this.pollingInterval);
+    }
+    this.log.debug(`Starting polling for ${this.name}`);
+    this.pollingInterval = setInterval(async () => {
+      if (this.lock.offline || this.platform.isShuttingDown) {
+        if (this.isUpdating) {
+          this.isUpdating = false;
+          this.updateEmitter.emit('updateComplete');
+        }
+        this.stopPolling();
+      } else {
+        await this.updateState();
+      }
+    }, this.platform.config.discoveryOptions.pollingInterval);
+  }
+
+  public stopPolling(): void {
+    if (this.pollingInterval) {
+      clearInterval(this.pollingInterval);
+      this.pollingInterval = undefined;
+      this.log.debug(`Stopped polling for ${this.name}`);
+    }
   }
 
   public identify(): void {
-    this.log.info(`Identifying lock: ${this.lock.alias}`);
+    this.log.info(`Lock identification triggered for ${this.lock.alias}`);
+  }
+
+  private async waitForPendingUpdates(): Promise<void> {
+    if (this.isUpdating || this.platform.periodicDeviceDiscovering) {
+      await Promise.race([
+        new Promise<void>((resolve) => this.updateEmitter.once('updateComplete', resolve)),
+        new Promise<void>((resolve) => this.updateEmitter.once('periodicDeviceDiscoveryComplete', resolve)),
+      ]);
+    }
+  }
+
+  private updateBatteryService() {
+    const batteryService = this.platformAccessory.getService(this.platform.api.hap.Service.Battery);
+    if (batteryService && this.previousLock && this.previousLock.battery !== this.lock.battery) {
+      batteryService.updateCharacteristic(this.platform.api.hap.Characteristic.BatteryLevel, this.lock.battery);
+      batteryService.updateCharacteristic(
+        this.platform.api.hap.Characteristic.StatusLowBattery,
+        this.lock.battery < 20 ? 1 : 0,
+      );
+      this.log.debug(
+        `Battery changed from ${this.previousLock.battery}% to ${this.lock.battery}% on ${this.name}`,
+      );
+    }
+  }
+
+  private updateLockService() {
+    const lockService = this.platformAccessory.getService(this.platform.api.hap.Service.LockMechanism);
+    if (lockService && this.previousLock && this.previousLock.state !== this.lock.state) {
+      lockService.updateCharacteristic(this.platform.api.hap.Characteristic.LockCurrentState, this.lock.state);
+      lockService.updateCharacteristic(this.platform.api.hap.Characteristic.LockTargetState, this.lock.state);
+      this.log.debug(`Lock state changed from ${this.previousLock.state} to ${this.lock.state} on ${this.name}`);
+    }
   }
 }
